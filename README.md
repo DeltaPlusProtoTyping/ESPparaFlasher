@@ -7,6 +7,8 @@ Built with **Kotlin + Compose for Desktop** (same stack as
 It scans for CP210x USB-UART programmers, lays them out as a grid of cards, shows
 each board's live status, and flashes them individually or all at once.
 
+![ESPparaFlasher screenshot](docs/screenshot.png)
+
 ## Features
 
 - **Auto-discovery** of CP210x COM ports (fast `reg`-based scan, ~tens of ms)
