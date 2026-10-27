@@ -9,6 +9,7 @@ import com.espflasher.model.FlashStatus
 import com.espflasher.model.LogLevel
 import com.espflasher.model.LogLine
 import com.espflasher.model.PortState
+import com.espflasher.theme.darkTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -69,6 +70,15 @@ class FlasherController(private val scope: CoroutineScope) {
     fun changeBaud(value: Int) {
         baud = value
         prefs.putInt("baud", value)
+    }
+
+    init {
+        darkTheme = prefs.getBoolean("darkTheme", false)
+    }
+
+    fun changeDarkTheme(on: Boolean) {
+        darkTheme = on
+        prefs.putBoolean("darkTheme", on)
     }
 
     fun changeAutoFlash(on: Boolean) {

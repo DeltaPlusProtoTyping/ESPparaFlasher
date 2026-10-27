@@ -26,6 +26,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.DeleteSweep
 import androidx.compose.material.icons.rounded.DeveloperBoard
 import androidx.compose.material.icons.rounded.ExpandLess
@@ -69,6 +71,7 @@ import com.espflasher.flash.FlasherController
 import com.espflasher.model.FlashStatus
 import com.espflasher.model.LogLevel
 import com.espflasher.theme.AppColors
+import com.espflasher.theme.darkTheme
 import java.io.File
 import javax.swing.JFileChooser
 
@@ -150,6 +153,13 @@ private fun AppBar(controller: FlasherController) {
         Spacer(Modifier.width(4.dp))
         IconButton(onClick = { controller.manualScan() }) {
             Icon(Icons.Rounded.Refresh, "Rescan ports", tint = AppColors.textSecondary)
+        }
+        IconButton(onClick = { controller.changeDarkTheme(!darkTheme) }) {
+            Icon(
+                if (darkTheme) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
+                if (darkTheme) "Light theme" else "Dark theme",
+                tint = AppColors.textSecondary,
+            )
         }
         Spacer(Modifier.width(8.dp))
     }
