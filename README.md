@@ -24,7 +24,11 @@ each board's live status, and flashes them individually or all at once.
   answered the bootloader or emitted UART traffic, so empty sockets stay grey
 - **Flash All / Reboot All**, plus per-card Flash and Reboot
 - **Reboot** pulses the serial control lines directly (no bootloader round-trip)
-- Editable build directory, live log panel, status legend
+- **Auto-flash** toggle — a board entering boot mode starts flashing on its own
+- Offsets and flash settings come from the build's `flash_args`; baud is selectable
+  (921600 default, drop to 460800 if a jig cable is marginal)
+- Build folder picker with a live check of what will be written; settings persist
+- Live log panel, status legend, per-session flashed/failed counts
 
 ## Requirements
 

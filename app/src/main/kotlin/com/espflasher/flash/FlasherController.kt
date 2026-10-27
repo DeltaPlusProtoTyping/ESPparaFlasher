@@ -6,6 +6,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import com.espflasher.model.FlashStatus
+import com.espflasher.model.LogLevel
+import com.espflasher.model.LogLine
 import com.espflasher.model.PortState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,83 +17,129 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import java.util.prefs.Preferences
 
 /**
  * Owns all app state and the background work. The UI observes [ports], [log],
- * and [buildDir]; buttons call the action methods, which run esptool off the UI
+ * and the settings; buttons call the action methods, which run off the UI
  * thread and write results back into the observable [PortState]s.
  */
 class FlasherController(private val scope: CoroutineScope) {
-    val ports: SnapshotStateList<PortState> = mutableStateListOf()
-    val log: SnapshotStateList<String> = mutableStateListOf()
+    private val prefs = Preferences.userNodeForPackage(FlasherController::class.java)
 
-    var buildDir by mutableStateOf("C:\\Users\\Benjamin\\LastOne1\\build")
+    val ports: SnapshotStateList<PortState> = mutableStateListOf()
+    val log: SnapshotStateList<LogLine> = mutableStateListOf()
+
+    // Settings persist across launches.
+    var buildDir by mutableStateOf(prefs.get("buildDir", "C:\\Users\\Benjamin\\LastOne1\\build"))
+        private set
+    var baud by mutableStateOf(prefs.getInt("baud", Esptool.DEFAULT_BAUD))
+        private set
+    var autoFlash by mutableStateOf(prefs.getBoolean("autoFlash", false))
+        private set
+
+    var build by mutableStateOf(Esptool.resolveBuild(buildDir))
+        private set
     var scanning by mutableStateOf(false)
+        private set
+    var sessionFlashed by mutableStateOf(0)
+        private set
+    var sessionFailed by mutableStateOf(0)
+        private set
 
     private val timeFmt = DateTimeFormatter.ofPattern("HH:mm:ss")
 
-    fun log(msg: String) {
-        log.add("${LocalTime.now().format(timeFmt)}  $msg")
+    fun log(msg: String, level: LogLevel = LogLevel.Info) {
+        log.add(LogLine(LocalTime.now().format(timeFmt), msg, level))
         if (log.size > 500) log.removeRange(0, log.size - 500)
+    }
+
+    fun clearLog() = log.clear()
+
+    fun changeBuildDir(dir: String) {
+        buildDir = dir
+        prefs.put("buildDir", dir)
+        build = Esptool.resolveBuild(dir)
+    }
+
+    fun changeBaud(value: Int) {
+        baud = value
+        prefs.putInt("baud", value)
+    }
+
+    fun changeAutoFlash(on: Boolean) {
+        autoFlash = on
+        prefs.putBoolean("autoFlash", on)
+        if (on) {
+            log("Auto-flash on: boards entering boot mode flash automatically")
+            ports.filter { it.status == FlashStatus.BootMode }.forEach { flashPort(it.port) }
+        }
     }
 
     private fun card(port: String): PortState? = ports.firstOrNull { it.port == port }
 
     /**
      * Two independent loops:
-     *  - presence: fast (1s) reg.exe scan so cards appear/disappear almost instantly.
-     *  - probe: boot-mode check of all idle ports IN PARALLEL, so the whole pass is
-     *    bounded by one esptool timeout (~3s) instead of N of them in series.
+     *  - presence: fast (1s) reg.exe scan so cards appear/disappear almost instantly,
+     *    plus a re-read of the build dir so a fresh `idf.py build` shows up.
+     *  - probe: boot-mode check of all idle ports IN PARALLEL, in-process.
      */
     fun startPolling() {
         scope.launch {
             while (isActive) {
                 refreshPorts()
+                val b = withContext(Dispatchers.IO) { Esptool.resolveBuild(buildDir) }
+                if (b != build) build = b
                 delay(1000)
             }
         }
         scope.launch {
             while (isActive) {
                 probeIdlePorts()
-                delay(1500)
+                delay(150)
             }
         }
     }
 
     private suspend fun probeIdlePorts() {
-        // Probe every port that isn't actively flashing — including Flashed/Failed ones
-        // — so we keep tracking connectivity and catch a board being put (back) into
-        // boot mode. The probe uses --before no-reset, so it never disturbs a board
-        // that's running firmware.
-        val candidates = ports.filter { !it.busy && it.status != FlashStatus.Flashing }
+        // Probe every port that isn't busy — including Flashed/Failed ones — so we keep
+        // tracking connectivity and catch a board being swapped or put (back) into boot
+        // mode. The probe never resets the chip.
+        val candidates = ports.filter { !it.busy }
         if (candidates.isEmpty()) return
-        // Fire every probe at once. For a port not in the bootloader, also sniff for
-        // UART traffic so we can tell a running ESP from an empty socket. Collect
-        // everything, then apply on the UI thread.
         val results = coroutineScope {
             candidates.map { p ->
                 async(Dispatchers.IO) {
-                    val mac = Esptool.probeBootMode(p.port)
-                    val active = if (mac == null) Esptool.hasSerialActivity(p.port) else false
-                    Triple(p, mac, active)
+                    // A flash/reboot that just claimed the port wins; skip it this pass.
+                    if (!p.lock.tryLock()) return@async null
+                    try { p to SerialIo.probe(p.port) } finally { p.lock.unlock() }
                 }
-            }.awaitAll()
+            }.awaitAll().filterNotNull()
         }
-        for ((p, mac, active) in results) {
-            if (p.busy || p.status == FlashStatus.Flashing) continue
+        for ((p, r) in results) {
+            if (p.busy) continue
+            val mac = r.bootMac
             if (mac != null) {
                 // Answering the ROM bootloader = proof of an ESP, in download mode. A
                 // just-flashed board sits here (EN isn't wired, so esptool's reset is a
-                // no-op), so keep the green "Flashed" badge; anything else is Boot Mode.
+                // no-op), so keep its Flashed/Failed badge while it's the same board.
                 p.espSeen = true
-                if (p.status != FlashStatus.Flashed) p.status = FlashStatus.BootMode
+                val before = p.status
+                val sameBoard = mac.isEmpty() || mac == p.lastMac
+                if (!(sameBoard && (before == FlashStatus.Flashed || before == FlashStatus.Failed))) {
+                    p.status = FlashStatus.BootMode
+                }
                 if (mac.isNotEmpty()) p.mac = mac
+                if (autoFlash && before != FlashStatus.BootMode && p.status == FlashStatus.BootMode) {
+                    flashPort(p.port)
+                }
             } else {
                 // Not in the bootloader. UART traffic is also proof of a live ESP.
-                if (active) p.espSeen = true
+                if (r.active) p.espSeen = true
                 if (p.espSeen) {
                     // Known-present ESP, now running firmware (e.g. physically reset out
                     // of boot mode / after a flash) -> Connected.
@@ -106,14 +154,13 @@ class FlasherController(private val scope: CoroutineScope) {
 
     suspend fun refreshPorts() {
         val found = withContext(Dispatchers.IO) { PortScanner.scan() }
-        // Remove gone ports.
+        val current = ports.map { it.port }
+        if (found == current) return
+        // Remove gone ports, add new ones. New cards start Unconnected (grey) — the
+        // programmer is present but we have no proof an ESP is seated yet.
         ports.removeAll { it.port !in found }
-        // Add new ports. Start Unconnected (grey) — the programmer is present but we
-        // have no proof an ESP is seated yet; the probe loop promotes it once it does.
         for (name in found) {
-            if (ports.none { it.port == name }) {
-                ports.add(PortState(name).also { it.status = FlashStatus.Unconnected })
-            }
+            if (ports.none { it.port == name }) ports.add(PortState(name))
         }
         ports.sortBy { it.port.removePrefix("COM").toIntOrNull() ?: 0 }
     }
@@ -121,51 +168,72 @@ class FlasherController(private val scope: CoroutineScope) {
     fun manualScan() {
         scope.launch {
             scanning = true
-            log("Scanning ports...")
             refreshPorts()
             log("Found ${ports.size} port(s)")
             scanning = false
         }
     }
 
+    /** Ports Flash All / Reboot All would act on. */
+    val actionable: List<PortState>
+        get() = ports.filter { !it.busy && it.status != FlashStatus.Unconnected }
+
     fun flashAll() {
-        val targets = ports.filter { !it.busy && it.status != FlashStatus.Unconnected }.map { it.port }
-        if (targets.isEmpty()) { log("No connected ports to flash"); return }
-        log("Flashing ${targets.size} port(s)...")
+        val targets = actionable.map { it.port }
+        if (targets.isEmpty()) { log("No connected boards to flash", LogLevel.Error); return }
+        log("Flashing ${targets.size} board(s) @ $baud baud")
         targets.forEach { flashPort(it) }
     }
 
     fun rebootAll() {
-        val targets = ports.filter { !it.busy && it.status != FlashStatus.Unconnected }.map { it.port }
-        if (targets.isEmpty()) { log("No connected ports to reboot"); return }
-        log("Rebooting ${targets.size} port(s)...")
+        val targets = actionable.map { it.port }
+        if (targets.isEmpty()) { log("No connected boards to reboot", LogLevel.Error); return }
         targets.forEach { rebootPort(it) }
     }
 
     fun flashPort(port: String) {
         val p = card(port) ?: return
         if (p.busy) return
-        val files = Esptool.resolveBuild(buildDir)
-        if (!files.allExist()) {
-            log("Missing build files: ${files.missing().joinToString { it.name }}")
+        val plan = Esptool.resolveBuild(buildDir)
+        if (!plan.ok) {
+            log("Missing build files: ${plan.missing.joinToString { it.name }.ifEmpty { "no images" }}", LogLevel.Error)
             return
         }
+        // Flashed boards on this jig are still sitting in the ROM bootloader.
+        val inBootMode = p.status == FlashStatus.BootMode || p.status == FlashStatus.Flashed
+        val rate = baud
         p.busy = true
         p.status = FlashStatus.Flashing
         p.progress = 0f
         p.detail = ""
+        p.error = ""
+        p.lastMac = p.mac
+        p.startedAt = System.currentTimeMillis()
         scope.launch {
-            log("$port: Flashing...")
-            val ok = withContext(Dispatchers.IO) {
-                Esptool.flash(port, files,
-                    onProgress = { prog -> p.progress = prog },
-                    onLine = { line -> if (line.isNotBlank()) p.detail = line })
+            // Waits for an in-flight probe (a few hundred ms at most) to release the port.
+            val res = p.lock.withLock {
+                withContext(Dispatchers.IO) {
+                    Esptool.flash(port, plan, rate, inBootMode,
+                        onProgress = { prog -> p.progress = prog },
+                        onLine = { line -> if (line.isNotBlank()) p.detail = line })
+                        .also { SerialIo.restoreStubBaud(port, rate) }
+                }
             }
-            if (ok) p.espSeen = true   // a successful flash is proof the ESP is present
-            p.status = if (ok) FlashStatus.Flashed else FlashStatus.Failed
-            p.progress = if (ok) 1f else p.progress
+            p.lastDurationMs = System.currentTimeMillis() - p.startedAt
+            val secs = "%.1fs".format(p.lastDurationMs / 1000.0)
+            if (res.ok) {
+                p.espSeen = true   // a successful flash is proof the ESP is present
+                p.status = FlashStatus.Flashed
+                p.progress = 1f
+                sessionFlashed++
+                log("$port: flashed in $secs", LogLevel.Ok)
+            } else {
+                p.status = FlashStatus.Failed
+                p.error = res.error
+                sessionFailed++
+                log("$port: FAILED after $secs — ${res.error}", LogLevel.Error)
+            }
             p.busy = false
-            log("$port: ${if (ok) "Flashed OK" else "FAILED"}")
         }
     }
 
@@ -174,11 +242,10 @@ class FlasherController(private val scope: CoroutineScope) {
         if (p.busy) return
         p.busy = true
         scope.launch {
-            log("$port: Rebooting...")
-            val ok = withContext(Dispatchers.IO) { Esptool.reboot(port) }
+            val ok = p.lock.withLock { withContext(Dispatchers.IO) { SerialIo.reboot(port) } }
             if (ok) p.status = FlashStatus.Connected
             p.busy = false
-            log("$port: ${if (ok) "Rebooted" else "Reboot failed"}")
+            log("$port: ${if (ok) "rebooted" else "reboot failed (port busy?)"}", if (ok) LogLevel.Info else LogLevel.Error)
         }
     }
 }

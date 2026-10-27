@@ -19,6 +19,8 @@ dependencies {
     implementation(compose.materialIconsExtended)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
+    // In-process serial access for probing/reboot (replaces spawning PowerShell/esptool per poll).
+    implementation("com.fazecast:jSerialComm:2.11.0")
 }
 
 compose.desktop {
